@@ -1,117 +1,195 @@
-import streamlit as st
+from flask import Flask, render_template, request
 import pandas as pd
-import plotly.express as px
-from analyzer import detect_cherry_picking
+import numpy as np
+import os
 
-# Page Configuration
-st.set_page_config(
-    page_title="Cherry Picking Detection Dashboard",
-    layout="wide",
-    page_icon="🍒"
-)
+from sklearn.ensemble import IsolationForest
+import plotly.graph_objs as go
+import plotly.io as pio
 
-# Custom Dark Theme
-st.markdown("""
-<style>
-    .stApp { background-color: #0f172a; color: #e2e8f0; }
-    .main-header { font-size: 2.5rem; font-weight: 700; text-align: center; color: #f8fafc; }
-    .sub-header { text-align: center; color: #94a3b8; font-size: 1.1rem; margin-bottom: 30px; }
-    .card { background-color: #1e2937; padding: 20px; border-radius: 12px; border: 1px solid #334155; }
-</style>
-""", unsafe_allow_html=True)
+app = Flask(__name__)
+app.config["UPLOAD_FOLDER"] = "uploads"
 
-st.markdown('<h1 class="main-header">🍒 Cherry Picking Detection Dashboard</h1>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Detect whether company growth claims are genuine or cherry-picked</p>', unsafe_allow_html=True)
+if not os.path.exists("uploads"):
+    os.makedirs("uploads")
 
-# ====================== INPUT SECTION ======================
-st.subheader("Data Analysis Portal")
 
-col1, col2 = st.columns([2, 1])
+# ========================= CORE ANALYSIS FUNCTION =========================
+def analyze_timeline(file_path, claimed_growth=None):
 
-with col1:
-    uploaded_file = st.file_uploader("Upload Excel or CSV file", type=["csv", "xlsx"])
+    # -------- LOAD FILE --------
+    if file_path.endswith(".csv"):
+        df = pd.read_csv(file_path)
+    else:
+        df = pd.read_excel(file_path)
 
-with col2:
-    claimed_growth = st.number_input("Enter company's claimed growth (%)", 
-                                   min_value=0.0, value=30.0, step=0.5)
+    # -------- HANDLE DIFFERENT DATASETS --------
+    if "Order Date" in df.columns and "Total Sales" in df.columns:
+        df = df.rename(columns={"Order Date": "date", "Total Sales": "sales"})
 
-analyze_button = st.button("Analyze Data and View Results", type="primary", use_container_width=True)
+    elif "OrderDate" in df.columns and "TotalAmount" in df.columns:
+        df = df.rename(columns={"OrderDate": "date", "TotalAmount": "sales"})
 
-# ====================== ANALYSIS ======================
-if uploaded_file and analyze_button:
-    try:
-        # Load file
-        if uploaded_file.name.endswith('.xlsx'):
-            df = pd.read_excel(uploaded_file)
+    elif "date" not in df.columns or "sales" not in df.columns:
+        raise Exception("Required columns not found. Use (date + sales) OR Amazon dataset.")
+
+    # -------- CLEAN DATA --------
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["sales"] = pd.to_numeric(df["sales"], errors="coerce")
+
+    df = df.dropna(subset=["date", "sales"])
+    df = df.sort_values("date")
+
+    # -------- MONTHLY AGGREGATION --------
+    monthly = df.groupby(
+        pd.Grouper(key="date", freq="ME")
+    )["sales"].sum().reset_index()
+
+    monthly.columns = ["date", "sales"]
+
+    # -------- GROWTH --------
+    monthly["growth"] = monthly["sales"].pct_change() * 100
+
+    avg_growth = monthly["growth"].mean()
+    std_growth = monthly["growth"].std()
+
+    # -------- ML (FIXED NO .iloc ISSUE) --------
+    model = IsolationForest(contamination=0.2, random_state=42)
+
+    # IMPORTANT FIX: store in dataframe (NOT numpy)
+    monthly["ml_flag"] = model.fit_predict(monthly[["sales"]])
+    monthly["ml_flag"] = (monthly["ml_flag"] == -1).astype(int)
+
+    anomaly_ratio = monthly["ml_flag"].mean()
+
+    # -------- CLAIM LOGIC --------
+    verdict = "No Claim Provided"
+    insight = "Please enter a claimed growth percentage."
+    coverage_percent = 0
+
+    if claimed_growth is not None:
+
+        z_claim = (claimed_growth - avg_growth) / std_growth if std_growth != 0 else 0
+
+        tolerance = max(5, claimed_growth * 0.15)
+
+        matches = monthly[
+            (monthly["growth"] >= claimed_growth - tolerance) &
+            (monthly["growth"] <= claimed_growth + tolerance)
+        ]
+
+        coverage = len(matches) / len(monthly) if len(monthly) > 0 else 0
+        coverage_percent = round(coverage * 100, 2)
+
+        if z_claim > 2 and coverage < 0.2:
+            verdict = "Cherry Picked / Misleading"
+            insight = "The reported growth is significantly higher than the overall trend and appears only in limited time periods."
+
+        elif abs(z_claim) < 1 and coverage > 0.5:
+            verdict = "Valid Claim"
+            insight = "The reported growth is consistent across the dataset."
+
         else:
-            df = pd.read_csv(uploaded_file)
+            verdict = "Partially Supported"
+            insight = "The reported growth is not consistently supported across the dataset."
 
-        # ================== Handle Amazon Dataset Columns ==================
-        if 'OrderDate' in df.columns and 'TotalAmount' in df.columns:
-            df = df.rename(columns={'OrderDate': 'date', 'TotalAmount': 'sales'})
-            st.info("✅ Amazon Sales Dataset detected. Using OrderDate and TotalAmount columns.")
-        elif 'date' not in df.columns or 'sales' not in df.columns:
-            st.error("❌ Required columns not found. Please make sure your file has 'date' and 'sales' columns, or use the Amazon dataset (OrderDate + TotalAmount).")
-            st.stop()
+        if anomaly_ratio > 0.3:
+            insight += " Data shows seasonal or irregular spikes."
 
-        # Convert date and aggregate to monthly sales (very important for time-series)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.groupby(df['date'].dt.to_period('M'))['sales'].sum().reset_index()
-        df['date'] = df['date'].dt.to_timestamp()
+    # -------- SUMMARY --------
+    total_sales = monthly["sales"].sum()
+    avg_sales = monthly["sales"].mean()
 
-        df = df.sort_values('date').reset_index(drop=True)
+    # -------- GRAPH --------
+    fig = go.Figure()
 
-        st.success(f"✅ Loaded {len(df)} monthly records from {df['date'].min().date()} to {df['date'].max().date()}")
+    # Main line
+    fig.add_trace(go.Scatter(
+        x=monthly["date"],
+        y=monthly["sales"],
+        mode='lines',
+        line=dict(color='#38bdf8', width=4, shape='spline'),
+        customdata=monthly["growth"],
+        hovertemplate="Date: %{x}<br>Sales: %{y}<br>Growth: %{customdata:.2f}%"
+    ))
 
-        # Run Analysis
-        with st.spinner("Analyzing using Statistical + ML methods..."):
-            result = detect_cherry_picking(df, claimed_growth)
+    # Highlight anomalies (ML)
+    anomalies = monthly[monthly["ml_flag"] == 1]
 
-        # ====================== CLAIM EXPLANATION SECTION ======================
-        st.subheader("Claim Explanation Section")
+    fig.add_trace(go.Scatter(
+        x=anomalies["date"],
+        y=anomalies["sales"],
+        mode='markers',
+        marker=dict(color='red', size=10),
+        name="Irregular / Peak Periods"
+    ))
 
-        colA, colB, colC = st.columns(3)
-        with colA:
-            st.metric("Claimed Growth %", f"{result['claimed_growth']}%")
-        with colB:
-            st.metric("Average Growth %", f"{result['avg_monthly_growth']}%")
-        with colC:
-            st.metric("Overall CAGR", f"{result['cagr']}%")
+    fig.update_layout(
+        template="plotly_dark",
+        showlegend=True,
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            rangeselector=dict(
+                buttons=[
+                    dict(count=6, label="6M", step="month"),
+                    dict(count=1, label="1Y", step="year"),
+                    dict(step="all", label="All")
+                ]
+            )
+        ),
+        hovermode="x unified"
+    )
 
-        # Verdict Card
-        risk_color = "#22c55e" if result['risk_score'] <= 35 else "#eab308" if result['risk_score'] <= 70 else "#ef4444"
-        st.markdown(f"""
-        <div style="background-color:#1e2937; padding:25px; border-radius:12px; text-align:center; border:3px solid {risk_color}; margin:20px 0;">
-            <h2 style="color:{risk_color};">{result['verdict']}</h2>
-            <h3>Risk Score: <strong>{result['risk_score']}/100</strong></h3>
-        </div>
-        """, unsafe_allow_html=True)
+    graph_html = pio.to_html(fig, full_html=False)
 
-        st.info(result['explanation'])
+    return (
+        verdict,
+        insight,
+        graph_html,
+        total_sales,
+        avg_sales,
+        avg_growth,
+        coverage_percent
+    )
 
-        # ====================== INTERACTIVE GRAPHS ======================
-        st.subheader("Interactive Graph Section")
 
-        df['growth_rate'] = df['sales'].pct_change() * 100
+# ========================= ROUTE =========================
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        try:
+            file = request.files["file"]
 
-        # Growth Rate Chart
-        fig = px.line(df, x='date', y='growth_rate', template="plotly_dark",
-                      title="Monthly Growth Rate (%) vs Claimed Growth")
-        fig.add_hline(y=claimed_growth, line_dash="dash", line_color="#f87171",
-                      annotation_text=f"Claimed {claimed_growth}%")
-        fig.update_layout(height=520, hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
+            if file.filename == "":
+                return "No file selected"
 
-        # Sales Trend Chart
-        fig2 = px.line(df, x='date', y='sales', template="plotly_dark",
-                       title="Monthly Sales Trend Over Time")
-        fig2.update_layout(height=400)
-        st.plotly_chart(fig2, use_container_width=True)
+            claimed_growth = request.form.get("claimed_growth")
+            claimed_growth = float(claimed_growth) if claimed_growth else None
 
-    except Exception as e:
-        st.error(f"Error: {str(e)}")
+            path = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
+            file.save(path)
 
-else:
-    st.info("👆 Upload the Amazon Sales Dataset (or any sales CSV) and click the Analyze button.")
+            result = analyze_timeline(path, claimed_growth)
 
-st.caption("Cherry Picked Sales Trend Detection using Statistical Analysis and ML")
+            return render_template(
+                "index.html",
+                verdict=result[0],
+                insight=result[1],
+                graph=result[2],
+                total_sales=round(result[3], 2),
+                avg_sales=round(result[4], 2),
+                avg_growth=round(result[5], 2),
+                coverage_percent=result[6],
+                claimed_growth=claimed_growth,
+                show_results=True
+            )
+
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    return render_template("index.html", show_results=False)
+
+
+# ========================= RUN =========================
+if __name__ == "__main__":
+    app.run(debug=True)

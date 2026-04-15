@@ -1,69 +1,71 @@
 import pandas as pd
-import numpy as np
-from statsmodels.tsa.seasonal import STL
-from sklearn.ensemble import IsolationForest
 
 def calculate_cagr(df):
     if len(df) < 2:
         return 0.0
-    years = (df['date'].iloc[-1] - df['date'].iloc[0]).days / 365.25
-    return ((df['sales'].iloc[-1] / df['sales'].iloc[0]) ** (1 / years) - 1) * 100
+    start_sales = float(df['sales'].iloc[0])
+    end_sales = float(df['sales'].iloc[-1])
+    years = (pd.to_datetime(df['date'].iloc[-1]) - pd.to_datetime(df['date'].iloc[0])).days / 365.25
+    if years <= 0:
+        return 0.0
+    return ((end_sales / start_sales) ** (1 / years) - 1) * 100
 
-def detect_cherry_picking(df: pd.DataFrame, claimed_growth: float):
+def calculate_growth_in_period(df, months):
+    if len(df) < months:
+        return 0.0
+    recent = df.tail(months)
+    return ((recent['sales'].iloc[-1] / recent['sales'].iloc[0]) - 1) * 100
+
+def detect_cherry_picking(df: pd.DataFrame, claimed_growth: float, claim_period_months: int = 4):
     df = df.copy()
     df['growth_rate'] = df['sales'].pct_change() * 100
     
-    # Statistical Metrics
-    avg_growth = df['growth_rate'].mean()
-    cagr = calculate_cagr(df)
-    std_growth = df['growth_rate'].std() if df['growth_rate'].std() > 0 else 1
-    z_score = (claimed_growth - avg_growth) / std_growth
+    actual_cagr = calculate_cagr(df)
+    growth_in_claimed_period = calculate_growth_in_period(df, claim_period_months)
     
-    # Temporal Coverage
-    tolerance = 8.0
-    coverage = (abs(df['growth_rate'] - claimed_growth) <= tolerance).mean() * 100
-    
-    # Rolling Window (6-month)
+    # Rolling 6-month growth for comparison
     rolling_6m = df['sales'].rolling(window=6, min_periods=3).apply(
-        lambda x: ((x.iloc[-1] / x.iloc[0]) - 1) * 100 if len(x) > 1 else 0, raw=True)
-    max_rolling_6m = rolling_6m.max()
+        lambda x: ((x[-1] / x[0]) - 1) * 100 if len(x) > 1 else 0, raw=True)
+    max_historical_6m = rolling_6m.max()
     
-    # ML Part: STL + Isolation Forest on residuals
-    df_temp = df.set_index('date').asfreq('MS').interpolate()
-    stl = STL(df_temp['sales'], seasonal=13, robust=True)
-    res = stl.fit()
-    residuals = res.resid.values.reshape(-1, 1)
+    # Claimed months names for display
+    claimed_months = df.tail(claim_period_months)['date'].dt.strftime('%b %Y').tolist()
     
-    iso = IsolationForest(contamination=0.08, random_state=42)
-    anomalies = iso.fit_predict(residuals)
-    anomaly_pct = (anomalies == -1).mean() * 100
-    
-    # Risk Score
+    # Risk Score - Focused on Cherry-Picking
     risk_score = 0
-    if abs(z_score) > 2.0: risk_score += 35
-    if coverage < 18: risk_score += 30
-    if anomaly_pct > 18: risk_score += 20
-    if max_rolling_6m > claimed_growth * 1.4 and coverage < 25: risk_score += 25
+    if growth_in_claimed_period > claimed_growth * 1.3:
+        risk_score += 30
+    if growth_in_claimed_period > max_historical_6m * 1.4:
+        risk_score += 35
+    if actual_cagr < claimed_growth * 0.4:
+        risk_score += 25
+    if actual_cagr < 0 and claimed_growth > 0:
+        risk_score += 20
     risk_score = min(100, max(0, risk_score))
-    
+
     # Verdict
-    if risk_score <= 35:
-        verdict = "✅ Low Risk - Likely Representative Trend"
-    elif risk_score <= 70:
-        verdict = "⚠️ Medium Risk - Partially Supported (Possible Cherry Picking)"
+    if risk_score >= 65:
+        verdict = "❌ High Risk - Likely Cherry-Picked"
+    elif risk_score >= 40:
+        verdict = "⚠️ Medium Risk - Partially Supported"
     else:
-        verdict = "❌ High Risk - Likely Cherry Picked Sales Trend"
-    
+        verdict = "✅ Low Risk - Likely Genuine"
+
+    explanation = f"Company claims **{claimed_growth}% growth in last {claim_period_months} months**. "
+    explanation += f"Actual growth in that period: **{growth_in_claimed_period:.1f}%**. "
+    explanation += f"Overall CAGR: {actual_cagr:.2f}%. Highest historical 6-month growth: {max_historical_6m:.1f}%."
+
+    if growth_in_claimed_period > max_historical_6m * 1.3:
+        explanation += f" The last {claim_period_months} months show unusually high growth compared to history — strong sign of cherry-picking."
+
     return {
         "verdict": verdict,
         "risk_score": round(risk_score, 1),
         "claimed_growth": claimed_growth,
-        "cagr": round(cagr, 2),
-        "avg_monthly_growth": round(avg_growth, 2),
-        "temporal_coverage_pct": round(coverage, 1),
-        "anomaly_percentage": round(anomaly_pct, 1),
-        "max_6m_rolling": round(max_rolling_6m, 1),
-        "explanation": f"The claimed {claimed_growth}% growth appears in only {coverage:.1f}% of all periods. "
-                      f"Overall CAGR is {cagr:.2f}%. Highest 6-month growth reached {max_rolling_6m:.1f}%. "
-                      f"Anomalies detected after removing seasonality: {anomaly_pct:.1f}%."
+        "claim_period": claim_period_months,
+        "actual_growth_in_period": round(growth_in_claimed_period, 1),
+        "actual_cagr": round(actual_cagr, 2),
+        "max_historical_6m": round(max_historical_6m, 1),
+        "claimed_months": claimed_months,
+        "explanation": explanation
     }
